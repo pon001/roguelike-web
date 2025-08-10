@@ -1,1 +1,281 @@
-<h1>Hello Roguelike</h1> 
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no" />
+<title>Simple Roguelike MVP</title>
+<style>
+  :root{--bg:#0f0f12;--fg:#e8e8f0;--muted:#9aa0a6;--accent:#7dd3fc;--danger:#fca5a5;--ok:#a7f3d0;}
+  *{box-sizing:border-box} html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 monospace;display:flex;flex-direction:column;align-items:center;gap:10px}
+  header{width:100%;max-width:520px;display:flex;justify-content:space-between;align-items:center;padding:8px 12px}
+  header .stats{display:flex;gap:12px;font-weight:600}
+  header .stats span{padding:2px 8px;border-radius:6px;background:#16161a}
+  header .stats .hp{color:var(--ok)} header .stats .depth{color:var(--accent)} header .stats .pot{color:#fde68a}
+  #wrap{position:relative;width:min(92vw,520px);aspect-ratio:1/1;border:1px solid #222;border-radius:10px;overflow:hidden;box-shadow:0 6px 18px rgba(0,0,0,.35)}
+  canvas{width:100%;height:100%;image-rendering:pixelated;background:#111}
+  #log{width:min(92vw,520px);min-height:2.2em;color:var(--muted)}
+  #pad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;width:min(92vw,520px);touch-action:manipulation}
+  #pad button{height:52px;border:1px solid #333;background:#1a1d22;color:#cbd5e1;border-radius:10px;font:600 16px/1 monospace}
+  #pad button:active{filter:brightness(1.2)}
+  .hidden{display:none}
+</style>
+</head>
+<body>
+<header>
+  <strong>Simple Roguelike</strong>
+  <div class="stats">
+    <span class="hp">HP: <b id="hp">20</b></span>
+    <span class="depth">F: <b id="depth">1</b></span>
+    <span class="pot">☕︎: <b id="pots">0</b></span>
+  </div>
+</header>
+
+<div id="wrap"><canvas id="cv" width="320" height="320"></canvas></div>
+<pre id="log">矢印/WASD で移動。☕︎=回復薬（+10HP）。階段（⇩）で次フロア。</pre>
+
+<div id="pad">
+  <span></span><button data-dir="U">↑</button><span></span>
+  <button data-dir="L">←</button><button data-dir="use">☕︎</button><button data-dir="R">→</button>
+  <span></span><button data-dir="D">↓</button><span></span>
+</div>
+
+<script>
+(()=>{
+// ====== 基本設定 ======
+const W=20,H=20,T=16; // グリッドサイズ/タイルピクセル
+const MAX_ENEMIES=6;  // 初期の敵数
+const ctx = document.getElementById('cv').getContext('2d');
+ctx.imageSmoothingEnabled=false;
+
+const hpEl = document.getElementById('hp');
+const depthEl = document.getElementById('depth');
+const potsEl = document.getElementById('pots');
+const logEl = document.getElementById('log');
+
+const TILE={WALL:1,FLOOR:0,STAIRS:2,POTION:3};
+let map, player, enemies, depth=1;
+
+// ====== 便利関数 ======
+const rnd=(n)=>Math.floor(Math.random()*n);
+const clamp=(a,min,max)=>a<min?min:a>max?max:a;
+const inB=(x,y)=>x>=0&&y>=0&&x<W&&y<H;
+const dist=(a,b)=>Math.abs(a.x-b.x)+Math.abs(a.y-b.y);
+function log(msg){ logEl.textContent=msg; }
+
+// ====== マップ生成（超シンプル：外周壁＋中は床、少しだけ内壁を散らす） ======
+function genMap(){
+  map = Array.from({length:H},(_,y)=>Array.from({length:W},(_,x)=>{
+    if(x===0||y===0||x===W-1||y===H-1) return TILE.WALL;
+    return TILE.FLOOR;
+  }));
+  // ランダムな内壁（少なめ）
+  for(let i=0;i<Math.floor((W*H)*0.08);i++){
+    let x=rnd(W-2)+1, y=rnd(H-2)+1;
+    map[y][x]=TILE.WALL;
+  }
+  // 広場を確保（プレイヤー周辺は床に）
+  const sx = 1+rnd(W-2), sy = 1+rnd(H-2);
+  player = {x:sx,y:sy,hp:20,atk:2,def:0,pots:(player?.pots??0),alive:true};
+  for(let y=sy-1;y<=sy+1;y++)for(let x=sx-1;x<=sx+1;x++) if(inB(x,y)) map[y][x]=TILE.FLOOR;
+
+  // 階段は遠目に
+  let tx,ty;
+  do{ tx=rnd(W-2)+1; ty=rnd(H-2)+1; }while(map[ty][tx]!==TILE.FLOOR || (Math.abs(tx-sx)+Math.abs(ty-sy)<8));
+  map[ty][tx]=TILE.STAIRS;
+
+  // 回復薬（☕︎）を数個
+  for(let i=0;i<3;i++){
+    let x,y; do{ x=rnd(W-2)+1; y=rnd(H-2)+1; }while(map[y][x]!==TILE.FLOOR);
+    map[y][x]=TILE.POTION;
+  }
+
+  // 敵を配置
+  enemies=[];
+  for(let i=0;i<MAX_ENEMIES+Math.floor(depth*0.4);i++){
+    let x,y; do{ x=rnd(W-2)+1;y=rnd(H-2)+1; }while(map[y][x]!==TILE.FLOOR || (x===player.x&&y===player.y));
+    // 階層で少し強化
+    const tier = 1 + Math.floor(depth/3);
+    enemies.push({x,y,hp:3+tier,atk:1+tier,ai:'chase'});
+  }
+}
+// ====== 描画 ======
+function draw(){
+  ctx.clearRect(0,0,320,320);
+  // 背景
+  ctx.fillStyle="#0b0b0e"; ctx.fillRect(0,0,320,320);
+
+  // 視界（周囲3マスだけ明るく）
+  const visR=3;
+  for(let y=0;y<H;y++){
+    for(let x=0;x<W;x++){
+      let t=map[y][x];
+      const dx=Math.abs(x-player.x), dy=Math.abs(y-player.y);
+      const visible = (dx<=visR && dy<=visR);
+      // 床/壁
+      if(t===TILE.WALL){
+        ctx.fillStyle=visible?"#1f2937":"#0f172a";
+        ctx.fillRect(x*T,y*T,T,T);
+      }else{
+        ctx.fillStyle=visible?"#111827":"#0b0f19";
+        ctx.fillRect(x*T,y*T,T,T);
+        // 装飾
+        if(t===TILE.STAIRS){
+          ctx.fillStyle=visible?"#7dd3fc":"#365a75";
+          ctx.fillText("⇩", x*T+4, y*T+12);
+        }else if(t===TILE.POTION){
+          ctx.fillStyle=visible?"#fde68a":"#5e4f25";
+          ctx.fillText("☕︎", x*T+4, y*T+12);
+        }else{
+          ctx.fillStyle=visible?"#111":"#000"; // 微妙なノイズ
+          ctx.globalAlpha=0.08; ctx.fillRect(x*T+2,y*T+2,1,1); ctx.globalAlpha=1;
+        }
+      }
+    }
+  }
+  // 敵
+  for(const e of enemies){
+    const visible = (Math.abs(e.x-player.x)<=3 && Math.abs(e.y-player.y)<=3);
+    if(!visible) continue;
+    ctx.fillStyle="#fca5a5"; ctx.fillText("E", e.x*T+4, e.y*T+12);
+  }
+  // プレイヤー
+  ctx.fillStyle="#a7f3d0"; ctx.fillText("@", player.x*T+4, player.y*T+12);
+
+  // UI更新
+  hpEl.textContent = player.hp;
+  depthEl.textContent = depth;
+  potsEl.textContent = player.pots;
+}
+// ====== ロジック ======
+function canMove(x,y){ return inB(x,y) && map[y][x]!==TILE.WALL && !enemies.some(e=>e.x===x&&e.y===y); }
+function enemyAt(x,y){ return enemies.find(e=>e.x===x&&e.y===y); }
+
+function tryMove(dx,dy){
+  if(!player.alive) return;
+  const nx=player.x+dx, ny=player.y+dy;
+  if(!inB(nx,ny)) return;
+
+  // 敵がいるなら攻撃
+  const foe = enemyAt(nx,ny);
+  if(foe){
+    attack(player, foe);
+    turnEnd(); // 敵ターンへ
+    return;
+  }
+
+  // 壁以外なら移動
+  if(map[ny][nx]!==TILE.WALL){
+    player.x=nx; player.y=ny;
+    // 着地イベント
+    if(map[ny][nx]===TILE.POTION){
+      player.pots=(player.pots||0)+1;
+      map[ny][nx]=TILE.FLOOR;
+      log("☕︎ 回復薬を拾った（+1）");
+    }else if(map[ny][nx]===TILE.STAIRS){
+      depth++; log(`階段を降りた。F${depth}`);
+      genMap(); // 次フロア生成（持ち物は維持）
+    }else{
+      log("…");
+    }
+    turnEnd();
+  }
+}
+function usePotion(){
+  if(!player.alive) return;
+  if((player.pots||0)<=0){ log("☕︎がない"); return; }
+  player.pots--; player.hp = Math.min(player.hp+10, 20);
+  log("☕︎ を飲んだ（HP+10）");
+  turnEnd();
+}
+function attack(att,def){
+  const dmg = Math.max(1,(att.atk||2)-(def.def||0));
+  def.hp -= dmg;
+  if(def===player){
+    if(player.hp<=0 || def.hp<=0){} // not used
+  }
+  if(def!==player){
+    log(`敵に${dmg}ダメージ`);
+    if(def.hp<=0){
+      // 撃破
+      enemies = enemies.filter(e=>e!==def);
+      // 低確率で☕︎落とす
+      if(Math.random()<0.2){ player.pots=(player.pots||0)+1; log("敵が☕︎を落とした"); }
+    }
+  }else{
+    log(`ダメージを受けた（-${dmg}）`);
+  }
+}
+
+function enemyTurn(){
+  for(const e of enemies){
+    // プレイヤー隣接なら攻撃
+    if(dist(e,player)===1){
+      attack(e,player);
+      if(player.hp<=0){ player.alive=false; gameOver(); return; }
+      continue;
+    }
+    // 追跡AI（単純なマンハッタン距離縮小）
+    let best = {x:e.x,y:e.y,d:dist(e,player)};
+    const dirs=[[1,0],[-1,0],[0,1],[0,-1]];
+    for(const [dx,dy] of dirs){
+      const nx=e.x+dx, ny=e.y+dy;
+      if(!inB(nx,ny)) continue;
+      if(map[ny][nx]===TILE.WALL) continue;
+      if(enemies.some(o=>o!==e && o.x===nx&&o.y===ny)) continue;
+      const d = Math.abs(nx-player.x)+Math.abs(ny-player.y);
+      if(d<best.d) best={x:nx,y:ny,d};
+    }
+    e.x=best.x; e.y=best.y;
+  }
+}
+function turnEnd(){
+  if(!player.alive) return;
+  enemyTurn();
+  draw();
+}
+function gameOver(){
+  log("ゲームオーバー。Rで再開");
+  draw();
+}
+
+// ====== 入力 ======
+const keyMap = {
+  ArrowUp:[0,-1], ArrowDown:[0,1], ArrowLeft:[-1,0], ArrowRight:[1,0],
+  w:[0,-1], s:[0,1], a:[-1,0], d:[1,0]
+};
+addEventListener('keydown', (e)=>{
+  if(!player?.alive && (e.key==='r'||e.key==='R')){ restart(); return; }
+  if(e.key===' '){ e.preventDefault(); usePotion(); return; }
+  const v=keyMap[e.key]; if(!v) return;
+  e.preventDefault();
+  tryMove(v[0],v[1]);
+});
+
+// モバイル D-Pad
+document.getElementById('pad').addEventListener('click', (e)=>{
+  const b = e.target.closest('button'); if(!b) return;
+  const d = b.dataset.dir;
+  if(d==='use'){ usePotion(); return; }
+  if(d==='U') tryMove(0,-1);
+  if(d==='D') tryMove(0, 1);
+  if(d==='L') tryMove(-1,0);
+  if(d==='R') tryMove(1, 0);
+});
+
+// ====== 初期化 ======
+function restart(){
+  depth=1;
+  genMap();
+  player.alive=true;
+  player.pots=0;
+  player.hp=20;
+  log("冒険開始！");
+  draw();
+}
+ctx.font="14px monospace";
+restart();
+
+})();</script>
+</body>
+</html>
